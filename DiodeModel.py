@@ -5,122 +5,129 @@ import argparse
 from scipy.optimize import curve_fit
 from scipy.special import lambertw
 
-def func(VS, IS, N, RS):
-#Define model for diode (see wikipedia article)
+VT = 26e-3  # Thermal voltage
+
+# --- FITTING TARGET FUNCTION ---
+# def diode_model(VS, IS, N, RS, return_log=True):
+#     VS = np.asarray(VS)
+#     arg = (IS * RS / (N * VT)) * np.exp((VS + IS * RS) / (N * VT))
+#     w = lambertw(arg)
+#     I = (N * VT / RS) * w.real - IS
+#     I[I <= 0] = 1e-30  # Clamp to avoid log10 of nonpositive values
+#     if return_log:
+#         return np.log10(I)  # mA, log10
+#     else:
+#         return I  # mA, linear
+
+def diode_model(V, IS, N, RS, return_log=True):
+    V = np.asarray(V)
     VT = 26e-3
-    w = lambertw((IS * RS /(N * VT)) * np.exp((VS + IS * RS) / (N * VT)))
-    Current = np.log10((IS * ((w * N * VT / (RS * IS)) - 1) * 1000))
-    return Current.real
 
-def plot(xdata, ydata, nPoints, IS, N, RS):
-#generate a points to plot
-    vMin = xdata[0]
-    vMax = xdata[len(xdata) - 1],
-    vRange = vMax - vMin
-    vMin = vMin - 0.1 * vRange
-    vMax = vMax + 0.1 * vRange
-    vStep = (vMax - vMin) / (nPoints - 1)
-    VS = []
-    ID = []
-    for i in range(0, nPoints):
-        voltage = vMin + i * vStep
-        current = func(voltage, IS, N, RS)
-        VS.append(voltage)
-        ID.append(10**current)
+    def solve_current(v):
+        # Vectorized fixed-point iteration: I = IS * (exp((v - I*RS)/(N*VT)) - 1)
+        I = np.full_like(v, 1e-9)  # Initial guess: small forward current
+        for _ in range(100):
+            with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                exp_term = np.exp((v - I * RS) / (N * VT))
+                I_new = IS * (exp_term - 1)
+                I_new = np.where(np.isnan(I_new) | (I_new <= 0), 1e-30, I_new)
+            if np.allclose(I, I_new, rtol=1e-4):
+                break
+            I = I_new
+        return I
 
-#Plot the data and model
-    plt.figure().canvas.set_window_title('Plot Window') 
-    plt.semilogy(xdata, ydata, 'r*', VS, ID, 'b-')
-    plt.ylabel('Current / mA')
-    plt.xlabel('Voltage / V')
+    Iout = solve_current(V)
+    Iout = np.where(Iout <= 0, 1e-30, Iout)  # Safe clamp
+    return np.log10(Iout)
+
+
+# --- PLOT ---
+def plot(xdata, ydata, nPoints, IS, N, RS, return_log=True):
+    vMin, vMax = xdata[0], xdata[-1]
+    VS = np.linspace(vMin, vMax, nPoints)
+    
+    # Use log-mode always for consistent plotting
+    ID_log = diode_model(VS, IS, N, RS, return_log=True)
+    ID = 10 ** ID_log  * 1000# Convert log10(mA) → mA
+
+    plt.figure().canvas.manager.set_window_title('Plot Window')
+    plt.semilogy(xdata, ydata, 'r*', label="Data")
+    plt.semilogy(VS, ID*1000, 'b-', label="Model")
+    plt.ylabel('Current (mA)')
+    plt.xlabel('Voltage (V)')
     plt.title('Diode I-V Characteristic')
+    plt.grid(True, which='both')
+    plt.legend()
     plt.show()
 
+
+# --- MAIN ---
 def main():
-#set up parser for command line args
     parser = argparse.ArgumentParser(prog='DiodeModel.py')
-    parser.add_argument('filename', help='Name of file containing I-V data (I in mA, V in volts)')
-    parser.add_argument('-c', '--convert', help='Convert read in current to mA', action="store_true")
-    parser.add_argument('-p', '--plot', help='Just plot the data and initial guess, no fitting performed', action="store_true")
-    parser.add_argument('-IS', '--IS', type=float, default=1e-14, help='Initial guess at saturation current (default = 1e-14 A')
-    parser.add_argument('-N', '--N', type=float, default=1, help='Initial guess at Emission coefficient (default = 1)')
-    parser.add_argument('-RS', '--RS', type=float, default=10, help='Initial guess at ohmic resistance (default = 10 ohm)')
-    parser.add_argument('-m', '--maxit', type=int, default=1000, help='Maximum number of iterations (default = 1000)')
-    parser.add_argument('-n', '--npoints', type=int, default=250, help='Number of points in plot (default = 250)')
-    parser.add_argument('-s', '--save', help='Save fit parameters to file', action="store_true")
-    parser.add_argument('-f', '--fitfile', type=str, default="", nargs='?', help='Load fit parameters from specified file')
+    parser.add_argument('filename', help='I-V data file (V, I in mA or A)')
+    parser.add_argument('-c', '--convert', action="store_true", help='Convert current to mA')
+    parser.add_argument('-p', '--plot', action="store_true", help='Plot only, no fitting')
+    parser.add_argument('-IS', '--IS', type=float, default=1e-14)
+    parser.add_argument('-N', '--N', type=float, default=1.5)
+    parser.add_argument('-RS', '--RS', type=float, default=10)
+    parser.add_argument('-m', '--maxit', type=int, default=20000)
+    parser.add_argument('-n', '--npoints', type=int, default=250)
+    parser.add_argument('-s', '--save', action="store_true", help='Save fit to .fit file')
+    parser.add_argument('-f', '--fitfile', type=str, default="", nargs='?')
+    parser.add_argument('--linear', action='store_true', help='Fit in current space instead of log10')
+    parser.add_argument('--vcut', type=float, default=1.75, help='Voltage cutoff for turn-on region')
     args = parser.parse_args()
-    
-#Read in data from file (V in volt, I in milliamp)
+
     xdata, ydata = np.loadtxt(args.filename, unpack=True)
-    if args.convert:           #Data is in A convert to mA
-        ydata = ydata * 1000
-    logydata = np.log10(ydata) #log of current to produce stable fit
+    if args.convert:
+        ydata *= 1000  # Convert A → mA
 
-#Set up initial guess
-    params = dict(IS = args.IS, N = args.N, RS = args.RS)
+    # Mask data below turn-on threshold and <= 0
+    mask = (xdata > args.vcut) & (ydata > 0)
+    xdata, ydata = xdata[mask], ydata[mask]
+    ytarget = np.log10(ydata / 1000) if not args.linear else ydata
 
-#Check if input file is given
-    if args.fitfile is None:                              #Use default filename
-        fitFile = args.filename.split('.')[0] + ".fit"
-        try:
-            fh = open(fitFile, 'r')
+    params = {'IS': args.IS, 'N': args.N, 'RS': args.RS}
+    fitFile = args.fitfile if args.fitfile else args.filename.split('.')[0] + ".fit"
+    try:
+        with open(fitFile, 'r') as fh:
             for line in fh:
-                name = line.split('=')[0].strip()
-                value = float(line.split('=')[1].strip())
-                params[name] = value
-            fh.close()
-        except IOError as e:
-            print("I/O error({0}): {1}".format(e.errno, e.strerror))
-    elif len(args.fitfile) > 0:                           #Use input filename
-        fitFile = args.fitfile
-        try:
-            fh = open(fitFile, 'r')
-            for line in fh:
-                name = line.split('=')[0].strip()
-                value = float(line.split('=')[1].strip())
-                params[name] = value
-            fh.close()
-        except IOError as e:
-            print("I/O error({0}): {1}".format(e.errno, e.strerror))
-    
+                name, val = line.split('=')
+                params[name.strip()] = float(val.strip())
+    except IOError:
+        pass
+
     if args.plot:
-        try:
-#Plot data and initial guess
-            print("Plotting characteristic with following parameters" + 
-                "\nIS = " + str(params['IS']) + "\nN = " + str(params['N']) + "\nRS = " + str(params['RS']))
-            plot(xdata, ydata, args.npoints, params['IS'], params['N'], params['RS'])
-        except:
-            print("Plotting error")
-            exit()
-    else:
-#Perform non-linear least squares fit
-        try:
-            popt, pcov, infodict, errmsg, ier = curve_fit(
-                func, xdata, logydata, p0=(params['IS'], params['N'], params['RS']), maxfev = args.maxit, full_output = True)
-            
-#Print converged fit parameters
-            print("Fit converged in " + str(infodict['nfev']) + " iterations with the following parameters")
-            printString = "IS = " + str(popt[0]) + "\nN = " + str(popt[1]) + "\nRS = " + str(popt[2])
-            print(printString)
+        print(f"Plotting with parameters:\nIS={params['IS']:.2e}, N={params['N']:.3f}, RS={params['RS']:.3f}")
+        plot(xdata, ydata, args.npoints, params['IS'], params['N'], params['RS'])
+        return
 
-#Output parameters to file
-            if args.save:
-                print("\nWriting fit parameters to file")
-                outFile = args.filename.split('.')[0] + ".fit"
-                try:
-                    fh = open(outFile,"w")
-                    fh.write(printString)
-                    fh.close()
-                except IOError as e:
-                    print("I/O error({0}): {1}".format(e.errno, e.strerror))
+    # --- FITTING ---
+    try:
+        popt, pcov = curve_fit(
+            lambda V, IS, N, RS: diode_model(V, IS, N, RS, return_log=not args.linear),
+            xdata, ytarget,
+            p0=(params['IS'], params['N'], params['RS']),
+            bounds=([1e-18, 0.5, 0.01], [1e-8, 5.0, 100.0]),
+            maxfev=args.maxit
+        )
 
-#generate a plot of the fit
-            plot(xdata, ydata, args.npoints, popt[0], popt[1], popt[2])
+        print("Fit succeeded with:")
+        printString = f"IS = {popt[0]:.4e}\nN = {popt[1]:.4f}\nRS = {popt[2]:.4f}"
+        print(printString)
 
-        except RuntimeError:
-            print("Error - Fit did not converge, try adjusting the starting guess")
-            print(errmsg)
+        if args.save:
+            outFile = args.filename.split('.')[0] + ".fit"
+            with open(outFile, "w") as fh:
+                fh.write(printString)
+
+        plot(xdata, ydata, args.npoints, *popt)
+
+    except RuntimeError as e:
+        print("❌ Fit did not converge:")
+        print(str(e))
+        print("📉 Plotting initial guess instead.")
+        plot(xdata, ydata, args.npoints, params['IS'], params['N'], params['RS'])
 
 if __name__ == "__main__":
     main()
